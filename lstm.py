@@ -457,14 +457,29 @@ def print_confusion(
 
 
 def save_tflite_model(model: tf.keras.Model, output_path: str = "lstm_spoof_detector.tflite") -> None:
-    """Convert a trained Keras model to TensorFlow Lite and save it."""
-    converter = tf.lite.TFLiteConverter.from_keras_model(model)
-    converter.target_spec.supported_ops = [
-        tf.lite.OpsSet.TFLITE_BUILTINS,
-        tf.lite.OpsSet.SELECT_TF_OPS,
-    ]
+    """Convert a trained Keras model to TensorFlow Lite and save it.
 
-    tflite_model = converter.convert()
+    The model is cloned on CPU before conversion to avoid tracing GPU-only
+    CuDNN kernels (for example ``tf.CudnnRNNV3``), which TFLite cannot convert.
+    """
+    with tf.device("/CPU:0"):
+        export_model = tf.keras.models.clone_model(model)
+        export_model.set_weights(model.get_weights())
+
+    converter = tf.lite.TFLiteConverter.from_keras_model(export_model)
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
+
+    try:
+        tflite_model = converter.convert()
+    except Exception as err:
+        print(f"Builtins-only TFLite conversion failed ({err}); retrying with Select TF Ops.")
+        converter = tf.lite.TFLiteConverter.from_keras_model(export_model)
+        converter.target_spec.supported_ops = [
+            tf.lite.OpsSet.TFLITE_BUILTINS,
+            tf.lite.OpsSet.SELECT_TF_OPS,
+        ]
+        tflite_model = converter.convert()
+
     with open(output_path, "wb") as f:
         f.write(tflite_model)
 
