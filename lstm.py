@@ -462,8 +462,23 @@ def save_tflite_model(model: tf.keras.Model, output_path: str = "lstm_spoof_dete
     The model is cloned on CPU before conversion to avoid tracing GPU-only
     CuDNN kernels (for example ``tf.CudnnRNNV3``), which TFLite cannot convert.
     """
+    def _clone_layer_for_export(layer: tf.keras.layers.Layer) -> tf.keras.layers.Layer:
+        """Force an export-friendly LSTM implementation for TFLite conversion."""
+        if isinstance(layer, tf.keras.layers.LSTM):
+            cfg = layer.get_config()
+
+            # Prevent tracing GPU-only CuDNN kernels (tf.CudnnRNNV3) during export.
+            # Unrolling also keeps execution in standard TF ops that TFLite can lower.
+            cfg["unroll"] = True
+            if "use_cudnn" in cfg:
+                cfg["use_cudnn"] = False
+
+            return tf.keras.layers.LSTM.from_config(cfg)
+
+        return layer.__class__.from_config(layer.get_config())
+
     with tf.device("/CPU:0"):
-        export_model = tf.keras.models.clone_model(model)
+        export_model = tf.keras.models.clone_model(model, clone_function=_clone_layer_for_export)
         export_model.set_weights(model.get_weights())
 
     converter = tf.lite.TFLiteConverter.from_keras_model(export_model)
