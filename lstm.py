@@ -610,7 +610,7 @@ def main() -> None:
     # 7) Save final model (with best weights loaded)
     save_tflite_model(model, output_path=str(outputs_dir / "lstm_spoof_detector.tflite"))
     model.save(str(outputs_dir / "lstm_spoof_detector.keras"))
-    model.save(str(outputs_dir / "lstm_saved_model"))
+    model.export(str(outputs_dir / "lstm_saved_model"))
     model.save_weights(str(outputs_dir / "lstm_weights.weights.h5"))
     print("Saved: lstm_spoof_detector.keras")
     print("Saved: lstm_saved_model")
