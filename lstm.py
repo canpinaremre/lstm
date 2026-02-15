@@ -403,7 +403,14 @@ def build_model(cfg: Config, num_features: int) -> tf.keras.Model:
 
     model = tf.keras.Sequential([
         tf.keras.layers.Input(shape=(cfg.window, num_features)),
-        tf.keras.layers.LSTM(64, kernel_regularizer=reg, recurrent_regularizer=reg),
+        # Keep recurrent_dropout non-zero to avoid the GPU-only CudnnRNNV3 kernel,
+        # which cannot be converted to pure TFLite in this workflow.
+        tf.keras.layers.LSTM(
+            64,
+            kernel_regularizer=reg,
+            recurrent_regularizer=reg,
+            recurrent_dropout=1e-6,
+        ),
         tf.keras.layers.Dense(32, activation="relu", kernel_regularizer=reg),
         tf.keras.layers.Dense(1, activation="sigmoid"),
     ])
