@@ -517,7 +517,7 @@ def main() -> None:
 
     # 5) Model + checkpoint (train full epochs, keep best weights)
     model = build_model(cfg, num_features=len(cfg.feature_keys))
-    best_weights_path = "best_weights.weights.h5"
+    best_weights_path = "outputs/obest_weights.weights.h5"
 
     ckpt = tf.keras.callbacks.ModelCheckpoint(
         filepath=best_weights_path,
@@ -554,14 +554,14 @@ def main() -> None:
     print_confusion(model, X_test, y_test, threshold=0.5, title="TEST confusion")
 
     # 7) Save final model (with best weights loaded)
-    model.save("lstm_spoof_detector.keras")
-    model.save_weights("lstm_weights.weights.h5")
-    save_tflite_model(model, output_path="lstm_spoof_detector.tflite")
+    save_tflite_model(model, output_path="outputs/lstm_spoof_detector.tflite")
+    model.save("outputs/lstm_spoof_detector.keras")
+    model.save_weights("outputs/lstm_weights.weights.h5")
     print("Saved: lstm_spoof_detector.keras")
     print("Saved: lstm_weights.weights.h5")
 
     # Save training history for later plotting
-    np.savez("train_history.npz", **{k: np.array(v) for k, v in history.history.items()})
+    np.savez("outputs/train_history.npz", **{k: np.array(v) for k, v in history.history.items()})
     print("Saved: train_history.npz")
 
 
