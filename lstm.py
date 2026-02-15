@@ -1,4 +1,5 @@
 import sys
+from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -517,6 +518,8 @@ def configure_accelerator() -> None:
 
 def main() -> None:
     cfg = Config()
+    outputs_dir = Path("outputs")
+    outputs_dir.mkdir(parents=True, exist_ok=True)
 
     np.random.seed(cfg.seed)
     tf.random.set_seed(cfg.seed)
@@ -568,7 +571,7 @@ def main() -> None:
 
     # 5) Model + checkpoint (train full epochs, keep best weights)
     model = build_model(cfg, num_features=len(cfg.feature_keys))
-    best_weights_path = "outputs/obest_weights.weights.h5"
+    best_weights_path = str(outputs_dir / "obest_weights.weights.h5")
 
     ckpt = tf.keras.callbacks.ModelCheckpoint(
         filepath=best_weights_path,
@@ -605,14 +608,21 @@ def main() -> None:
     print_confusion(model, X_test, y_test, threshold=0.5, title="TEST confusion")
 
     # 7) Save final model (with best weights loaded)
-    save_tflite_model(model, output_path="outputs/lstm_spoof_detector.tflite")
-    model.save("outputs/lstm_spoof_detector.keras")
-    model.save_weights("outputs/lstm_weights.weights.h5")
+    save_tflite_model(model, output_path=str(outputs_dir / "lstm_spoof_detector.tflite"))
+    model.save(str(outputs_dir / "lstm_spoof_detector.keras"))
+    model.save(str(outputs_dir / "lstm_saved_model"))
+    model.save_weights(str(outputs_dir / "lstm_weights.weights.h5"))
     print("Saved: lstm_spoof_detector.keras")
+    print("Saved: lstm_saved_model")
     print("Saved: lstm_weights.weights.h5")
 
+    print(
+        "For eIQ Toolkit conversion, use outputs/lstm_saved_model or outputs/lstm_spoof_detector.keras "
+        "as the input model. Do not use outputs/lstm_spoof_detector.tflite as an eIQ input."
+    )
+
     # Save training history for later plotting
-    np.savez("outputs/train_history.npz", **{k: np.array(v) for k, v in history.history.items()})
+    np.savez(str(outputs_dir / "train_history.npz"), **{k: np.array(v) for k, v in history.history.items()})
     print("Saved: train_history.npz")
 
 
