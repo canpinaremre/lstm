@@ -450,6 +450,21 @@ def print_confusion(
     )
 
 
+def save_tflite_model(model: tf.keras.Model, output_path: str = "lstm_spoof_detector.tflite") -> None:
+    """Convert a trained Keras model to TensorFlow Lite and save it."""
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.target_spec.supported_ops = [
+        tf.lite.OpsSet.TFLITE_BUILTINS,
+        tf.lite.OpsSet.SELECT_TF_OPS,
+    ]
+
+    tflite_model = converter.convert()
+    with open(output_path, "wb") as f:
+        f.write(tflite_model)
+
+    print(f"Saved: {output_path}")
+
+
 def main() -> None:
     cfg = Config()
 
@@ -541,6 +556,7 @@ def main() -> None:
     # 7) Save final model (with best weights loaded)
     model.save("lstm_spoof_detector.keras")
     model.save_weights("lstm_weights.weights.h5")
+    save_tflite_model(model, output_path="lstm_spoof_detector.tflite")
     print("Saved: lstm_spoof_detector.keras")
     print("Saved: lstm_weights.weights.h5")
 
