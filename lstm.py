@@ -403,13 +403,12 @@ def build_model(cfg: Config, num_features: int) -> tf.keras.Model:
 
     model = tf.keras.Sequential([
         tf.keras.layers.Input(shape=(cfg.window, num_features)),
-        # Keep recurrent_dropout non-zero to avoid the GPU-only CudnnRNNV3 kernel,
-        # which cannot be converted to pure TFLite in this workflow.
+        # Keep recurrent_dropout at 0 so TensorFlow can use the fast cuDNN LSTM kernel on GPU.
         tf.keras.layers.LSTM(
             64,
             kernel_regularizer=reg,
             recurrent_regularizer=reg,
-            recurrent_dropout=1e-6,
+            recurrent_dropout=0.0,
         ),
         tf.keras.layers.Dense(32, activation="relu", kernel_regularizer=reg),
         tf.keras.layers.Dense(1, activation="sigmoid"),
@@ -472,11 +471,26 @@ def save_tflite_model(model: tf.keras.Model, output_path: str = "lstm_spoof_dete
     print(f"Saved: {output_path}")
 
 
+def configure_accelerator() -> None:
+    """Prefer GPU execution for training when available."""
+    gpus = tf.config.list_physical_devices("GPU")
+    if not gpus:
+        print("No GPU detected by TensorFlow; training will run on CPU.")
+        return
+
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+
+    names = ", ".join(gpu.name for gpu in gpus)
+    print(f"Using GPU for training: {names}")
+
+
 def main() -> None:
     cfg = Config()
 
     np.random.seed(cfg.seed)
     tf.random.set_seed(cfg.seed)
+    configure_accelerator()
 
     spoofed_path, genuine_path = pick_paths_from_user()
 
