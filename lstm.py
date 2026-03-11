@@ -25,7 +25,7 @@ class Config:
         "do_stdev",
         "do_mes_delta",
         "pr_stdev",
-        "pr_mes_delta",
+        # "pr_mes_delta",
     )
 
     # Sliding-window parameters
@@ -616,11 +616,6 @@ def main() -> None:
     print("Saved: lstm_spoof_detector.keras")
     print("Saved: lstm_saved_model")
     print("Saved: lstm_weights.weights.h5")
-
-    print(
-        "For eIQ Toolkit conversion, use outputs/lstm_saved_model or outputs/lstm_spoof_detector.keras "
-        "as the input model. Do not use outputs/lstm_spoof_detector.tflite as an eIQ input."
-    )
 
     # Save training history for later plotting
     np.savez(str(outputs_dir / "train_history.npz"), **{k: np.array(v) for k, v in history.history.items()})
