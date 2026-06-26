@@ -41,9 +41,9 @@ class Config:
 
     # Training parameters
     batch_size: int = 32
-    epochs: int = 30
-    seed: int = 58
-    shuffle_buffer: int = 5000
+    epochs: int = 300
+    seed: int = 580
+    shuffle_buffer: int = 500
 
     # Train all epochs, but keep best weights using ModelCheckpoint
     monitor_metric: str = "val_auc"  # or "val_prauc"
@@ -580,7 +580,7 @@ def main() -> None:
         mode="max",
         save_best_only=True,
         save_weights_only=True,
-        verbose=1,
+        verbose=2,
     )
 
     history = model.fit(
@@ -588,7 +588,7 @@ def main() -> None:
         validation_data=val_ds,
         epochs=cfg.epochs,
         callbacks=[ckpt],
-        verbose=1,
+        verbose=2,
     )
 
     # 6) Load best weights and evaluate
@@ -599,10 +599,10 @@ def main() -> None:
         print(f"Warning: could not load best weights ({e}). Using last epoch weights.")
 
     print("\nEvaluation (VAL):")
-    model.evaluate(val_ds, verbose=1)
+    model.evaluate(val_ds, verbose=2)
 
     print("\nEvaluation (TEST):")
-    model.evaluate(test_ds, verbose=1)
+    model.evaluate(test_ds, verbose=2)
 
     # Confusion matrices at default threshold 0.5
     print_confusion(model, X_val, y_val, threshold=0.5, title="VAL confusion")
