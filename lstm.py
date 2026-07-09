@@ -269,6 +269,7 @@ def stratified_sample_and_split(
     X_spoof: np.ndarray,
     X_genuine: np.ndarray,
     cfg: Config,
+    output_dir: Path,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     - Enforce cfg.spoof_ratio by downsampling (no oversampling).
@@ -371,8 +372,9 @@ def stratified_sample_and_split(
     print(f"  Val  : {X_val.shape} spoof%={y_val.mean() * 100:.1f}")
     print(f"  Test : {X_test.shape} spoof%={y_test.mean() * 100:.1f}")
 
+    dataset_params_path = output_dir / "dataset_params.npz"
     np.savez(
-        "dataset_params.npz",
+        dataset_params_path,
         seed=np.array([cfg.seed], dtype=np.int32),
         window=np.array([cfg.window], dtype=np.int32),
         stride=np.array([cfg.stride], dtype=np.int32),
@@ -387,7 +389,7 @@ def stratified_sample_and_split(
         val_size=np.array([len(y_val)], dtype=np.int64),
         test_size=np.array([len(y_test)], dtype=np.int64),
     )
-    print("Saved: dataset_params.npz")
+    print(f"Saved: {dataset_params_path}")
 
     return X_train, y_train, X_val, y_val, X_test, y_test
 
@@ -547,10 +549,9 @@ def configure_accelerator() -> None:
     print(f"Using GPU for training: {names}")
 
 
-def main(run_timestamp: str) -> None:
+def main(run_timestamp: str, run_dir: Path) -> None:
     cfg = Config()
-    outputs_dir = Path("outputs")
-    outputs_dir.mkdir(parents=True, exist_ok=True)
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     np.random.seed(cfg.seed)
     tf.random.set_seed(cfg.seed)
@@ -580,7 +581,9 @@ def main(run_timestamp: str) -> None:
         raise RuntimeError("No windows created. Reduce window, adjust stride, or check sv_id filtering.")
 
     # 2) Enforce spoof_ratio, then random stratified train/val/test split
-    X_train, y_train, X_val, y_val, X_test, y_test = stratified_sample_and_split(X_spoof, X_genuine, cfg)
+    X_train, y_train, X_val, y_val, X_test, y_test = stratified_sample_and_split(
+        X_spoof, X_genuine, cfg, run_dir
+    )
 
     # 3) Normalize (fit on train only)
     mean, std = standardize_fit(X_train)
@@ -588,21 +591,22 @@ def main(run_timestamp: str) -> None:
     X_val = standardize_apply(X_val, mean, std)
     X_test = standardize_apply(X_test, mean, std)
 
+    norm_params_path = run_dir / "norm_params.npz"
     np.savez(
-        "norm_params.npz",
+        norm_params_path,
         mean=mean,
         std=std,
         window=np.array([cfg.window], dtype=np.int32),
         feature_keys=np.array(cfg.feature_keys),
     )
-    print("Saved: norm_params.npz")
+    print(f"Saved: {norm_params_path}")
 
     # 4) tf.data
     train_ds, val_ds, test_ds = build_tf_datasets(X_train, y_train, X_val, y_val, X_test, y_test, cfg)
 
     # 5) Model + checkpoint (train full epochs, keep best weights)
     model = build_model(cfg, num_features=len(cfg.feature_keys))
-    best_weights_path = str(outputs_dir / "obest_weights.weights.h5")
+    best_weights_path = str(run_dir / "obest_weights.weights.h5")
 
     ckpt = tf.keras.callbacks.ModelCheckpoint(
         filepath=best_weights_path,
@@ -638,9 +642,10 @@ def main(run_timestamp: str) -> None:
     val_confusion = print_confusion(model, X_val, y_val, threshold=0.5, title="VAL confusion")
     test_confusion = print_confusion(model, X_test, y_test, threshold=0.5, title="TEST confusion")
 
-    eval_results_path = outputs_dir / f"evaluation_results_{run_timestamp}.json"
+    eval_results_path = run_dir / "evaluation_results.json"
     eval_results = {
         "timestamp": run_timestamp,
+        "run_dir": str(run_dir),
         "monitor_metric": cfg.monitor_metric,
         "best_weights_path": best_weights_path,
         "validation": {key: float(value) for key, value in val_results.items()},
@@ -653,31 +658,39 @@ def main(run_timestamp: str) -> None:
     print(f"Saved: {eval_results_path}")
 
     # 7) Save final model (with best weights loaded)
-    save_tflite_model(model, output_path=str(outputs_dir / "lstm_spoof_detector.tflite"))
-    model.save(str(outputs_dir / "lstm_spoof_detector.keras"))
-    model.export(str(outputs_dir / "lstm_saved_model"))
-    model.save_weights(str(outputs_dir / "lstm_weights.weights.h5"))
-    print("Saved: lstm_spoof_detector.keras")
-    print("Saved: lstm_saved_model")
-    print("Saved: lstm_weights.weights.h5")
+    tflite_path = run_dir / "lstm_spoof_detector.tflite"
+    keras_path = run_dir / "lstm_spoof_detector.keras"
+    saved_model_path = run_dir / "lstm_saved_model"
+    weights_path = run_dir / "lstm_weights.weights.h5"
+    save_tflite_model(model, output_path=str(tflite_path))
+    model.save(str(keras_path))
+    model.export(str(saved_model_path))
+    model.save_weights(str(weights_path))
+    print(f"Saved: {keras_path}")
+    print(f"Saved: {saved_model_path}")
+    print(f"Saved: {weights_path}")
 
     # Save training history for later plotting
-    np.savez(str(outputs_dir / "train_history.npz"), **{k: np.array(v) for k, v in history.history.items()})
-    print("Saved: train_history.npz")
+    train_history_path = run_dir / "train_history.npz"
+    np.savez(str(train_history_path), **{k: np.array(v) for k, v in history.history.items()})
+    print(f"Saved: {train_history_path}")
 
 
 def run_with_log() -> None:
     outputs_dir = Path("outputs")
     outputs_dir.mkdir(parents=True, exist_ok=True)
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = outputs_dir / f"run_{run_timestamp}.log"
+    run_dir = outputs_dir / run_timestamp
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_path = run_dir / "run.log"
 
     with open(log_path, "w", encoding="utf-8") as log_file:
         tee_stdout = Tee(sys.stdout, log_file)
         tee_stderr = Tee(sys.stderr, log_file)
         with redirect_stdout(tee_stdout), redirect_stderr(tee_stderr):
+            print(f"Run output directory: {run_dir}")
             print(f"Logging terminal output to: {log_path}")
-            main(run_timestamp)
+            main(run_timestamp, run_dir)
 
 
 if __name__ == "__main__":
