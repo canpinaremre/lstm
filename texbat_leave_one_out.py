@@ -2,9 +2,9 @@
 """Leave-one-dataset-out TEXBAT spoof detection workflow.
 
 For each spoofed dataset ds2_spoof through ds8_spoof:
-  - train on cleanDynamic + cleanStatic as genuine samples
+  - train on a cleanDynamic + cleanStatic genuine split
   - train on all other ds*_spoof datasets as spoof samples
-  - test on the excluded spoof dataset
+  - test on the excluded spoof dataset plus held-out clean samples
 
 The default epoch count is intentionally short for script validation.
 Increase --epochs for final experiments.
@@ -15,6 +15,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import shutil
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
@@ -59,7 +61,13 @@ def parse_args() -> argparse.Namespace:
         "--spoof-ratio",
         type=float,
         default=0.50,
-        help="Spoof fraction after downsampling train data only.",
+        help="Spoof fraction after downsampling train and evaluation data.",
+    )
+    parser.add_argument(
+        "--eval-clean-frac",
+        type=float,
+        default=0.20,
+        help="Fraction of clean windows reserved for balanced evaluation in each fold.",
     )
     parser.add_argument(
         "--threshold",
@@ -77,6 +85,11 @@ def parse_args() -> argparse.Namespace:
         "--no-save-models",
         action="store_true",
         help="Skip saving per-fold .keras models and weights.",
+    )
+    parser.add_argument(
+        "--skip-pdf",
+        action="store_true",
+        help="Write the LaTeX table but skip pdflatex PDF compilation.",
     )
     return parser.parse_args()
 
@@ -142,7 +155,7 @@ def concat_nonempty(arrays: Iterable[np.ndarray], name: str) -> np.ndarray:
     return np.concatenate(kept, axis=0)
 
 
-def downsample_train_classes(
+def downsample_classes(
     X_spoof: np.ndarray,
     X_clean: np.ndarray,
     spoof_ratio: float,
@@ -170,6 +183,26 @@ def downsample_train_classes(
     )
     order = rng.permutation(y.shape[0])
     return X[order], y[order]
+
+
+def split_clean_for_fold(
+    X_clean: np.ndarray,
+    eval_clean_frac: float,
+    seed: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if not (0.0 < eval_clean_frac < 1.0):
+        raise ValueError("--eval-clean-frac must be between 0 and 1.")
+    if X_clean.shape[0] < 4:
+        raise RuntimeError(f"Not enough clean windows to split: clean={X_clean.shape[0]}")
+
+    rng = np.random.default_rng(seed)
+    idx = np.arange(X_clean.shape[0])
+    rng.shuffle(idx)
+    n_eval = max(2, int(np.floor(X_clean.shape[0] * eval_clean_frac)))
+    n_eval = min(n_eval, X_clean.shape[0] - 2)
+    eval_idx = idx[:n_eval]
+    train_idx = idx[n_eval:]
+    return X_clean[train_idx], X_clean[eval_idx]
 
 
 def split_train_val(
@@ -242,6 +275,121 @@ def write_summary_csv(path: Path, rows: List[Dict[str, object]]) -> None:
         writer.writerows(rows)
 
 
+def latex_escape(value: object) -> str:
+    text = str(value)
+    return (
+        text.replace("\\", r"\textbackslash{}")
+        .replace("&", r"\&")
+        .replace("%", r"\%")
+        .replace("$", r"\$")
+        .replace("#", r"\#")
+        .replace("_", r"\_")
+        .replace("{", r"\{")
+        .replace("}", r"\}")
+    )
+
+
+def pct(value: object) -> str:
+    try:
+        return f"{100.0 * float(value):.2f}\\%"
+    except (TypeError, ValueError):
+        return "--"
+
+
+def write_latex_table(path: Path, rows: List[Dict[str, object]], cfg: Config, threshold: float) -> None:
+    lines = [
+        r"\documentclass{article}",
+        r"\usepackage[margin=0.75in]{geometry}",
+        r"\usepackage{booktabs}",
+        r"\usepackage{siunitx}",
+        r"\usepackage{caption}",
+        r"\begin{document}",
+        r"\begin{table}[htbp]",
+        r"\centering",
+        r"\caption{TEXBAT leave-one-out results with balanced training and evaluation sets.}",
+        r"\begin{tabular}{lrrrrrr}",
+        r"\toprule",
+        r"Held-out & Eval N & Accuracy & AUC & Precision & Recall & F1 \\",
+        r"\midrule",
+    ]
+    for row in rows:
+        lines.append(
+            " & ".join(
+                [
+                    latex_escape(row["excluded_dataset"]),
+                    str(row["test_windows_after_balance"]),
+                    pct(row["test_accuracy"]),
+                    f"{float(row['test_auc']):.4f}",
+                    pct(row["test_precision"]),
+                    pct(row["test_recall_detection_rate"]),
+                    pct(row["test_f1"]),
+                ]
+            )
+            + r" \\"
+        )
+
+    mean_accuracy = np.mean([float(row["test_accuracy"]) for row in rows])
+    mean_auc = np.mean([float(row["test_auc"]) for row in rows])
+    mean_precision = np.mean([float(row["test_precision"]) for row in rows])
+    mean_recall = np.mean([float(row["test_recall_detection_rate"]) for row in rows])
+    mean_f1 = np.mean([float(row["test_f1"]) for row in rows])
+    lines.extend(
+        [
+            r"\midrule",
+            " & ".join(
+                [
+                    r"\textbf{Mean}",
+                    "--",
+                    pct(mean_accuracy),
+                    f"{mean_auc:.4f}",
+                    pct(mean_precision),
+                    pct(mean_recall),
+                    pct(mean_f1),
+                ]
+            )
+            + r" \\",
+            r"\bottomrule",
+            r"\end{tabular}",
+            (
+                r"\caption*{Training spoof ratio = "
+                f"{cfg.spoof_ratio:.2f}; evaluation spoof ratio = {cfg.spoof_ratio:.2f}; "
+                f"threshold = {threshold:.2f}; epochs = {cfg.epochs}."
+                r"}"
+            ),
+            r"\end{table}",
+            r"\end{document}",
+            "",
+        ]
+    )
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def compile_latex_pdf(tex_path: Path) -> bool:
+    if shutil.which("pdflatex") is None:
+        print("pdflatex not found; wrote LaTeX table but skipped PDF compilation.")
+        return False
+
+    cmd = [
+        "pdflatex",
+        "-interaction=nonstopmode",
+        "-halt-on-error",
+        tex_path.name,
+    ]
+    result = subprocess.run(
+        cmd,
+        cwd=str(tex_path.parent),
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if result.returncode != 0:
+        print("pdflatex failed; see output below.")
+        print(result.stdout)
+        return False
+    return True
+
+
 def run_fold(
     excluded_ds: int,
     clean_windows: Dict[str, np.ndarray],
@@ -249,27 +397,38 @@ def run_fold(
     cfg: Config,
     output_dir: Path,
     threshold: float,
+    eval_clean_frac: float,
     save_models: bool,
 ) -> Dict[str, object]:
     print(f"\n=== Fold: leave out ds{excluded_ds}_spoof ===")
     fold_dir = output_dir / f"leave_out_ds{excluded_ds}"
     fold_dir.mkdir(parents=True, exist_ok=True)
 
-    X_clean = concat_nonempty(clean_windows.values(), "clean datasets")
+    X_clean_all = concat_nonempty(clean_windows.values(), "clean datasets")
+    X_clean_train, X_clean_eval = split_clean_for_fold(
+        X_clean_all,
+        eval_clean_frac=eval_clean_frac,
+        seed=cfg.seed + 500 + excluded_ds,
+    )
     X_spoof_train = concat_nonempty(
         (spoof_windows[ds_id] for ds_id in SPOOF_IDS if ds_id != excluded_ds),
         f"spoof train datasets excluding ds{excluded_ds}",
     )
-    X_test = spoof_windows[excluded_ds]
-    if X_test.shape[0] == 0:
+    X_spoof_eval = spoof_windows[excluded_ds]
+    if X_spoof_eval.shape[0] == 0:
         raise RuntimeError(f"No windows available for excluded ds{excluded_ds}_spoof.")
-    y_test = np.ones((X_test.shape[0],), dtype=np.int32)
 
-    X_balanced, y_balanced = downsample_train_classes(
+    X_balanced, y_balanced = downsample_classes(
         X_spoof_train,
-        X_clean,
+        X_clean_train,
         spoof_ratio=cfg.spoof_ratio,
         seed=cfg.seed + excluded_ds,
+    )
+    X_test, y_test = downsample_classes(
+        X_spoof_eval,
+        X_clean_eval,
+        spoof_ratio=cfg.spoof_ratio,
+        seed=cfg.seed + 1000 + excluded_ds,
     )
     X_train, y_train, X_val, y_val = split_train_val(
         X_balanced,
@@ -325,27 +484,39 @@ def run_fold(
     row: Dict[str, object] = {
         "excluded_dataset": f"ds{excluded_ds}_spoof",
         "train_spoof_windows": int(X_spoof_train.shape[0]),
-        "train_clean_windows": int(X_clean.shape[0]),
+        "train_clean_windows": int(X_clean_train.shape[0]),
         "train_windows_after_balance": int(X_train.shape[0]),
         "val_windows": int(X_val.shape[0]),
-        "excluded_test_windows": int(y_test.shape[0]),
+        "eval_clean_windows": int(X_clean_eval.shape[0]),
+        "eval_spoof_windows": int(X_spoof_eval.shape[0]),
+        "test_windows_after_balance": int(y_test.shape[0]),
+        "test_spoof_windows_after_balance": int(np.sum(y_test == 1)),
+        "test_clean_windows_after_balance": int(np.sum(y_test == 0)),
         "val_loss": float(val_eval.get("loss", np.nan)),
+        "val_accuracy": float(val_eval.get("acc", np.nan)),
         "val_auc": float(val_eval.get("auc", np.nan)),
         "test_loss": float(test_eval.get("loss", np.nan)),
+        "test_accuracy": test_metrics["accuracy"],
         "test_auc": float(test_eval.get("auc", np.nan)),
+        "test_precision": test_metrics["precision"],
         "test_recall_detection_rate": test_metrics["recall"],
+        "test_f1": test_metrics["f1"],
         "test_mean_probability": test_metrics["mean_probability"],
         "test_tp": test_metrics["tp"],
+        "test_tn": test_metrics["tn"],
+        "test_fp": test_metrics["fp"],
         "test_fn": test_metrics["fn"],
     }
     with (fold_dir / "metrics.json").open("w", encoding="utf-8") as f:
         json.dump(json_safe(row), f, indent=2, allow_nan=False)
 
     print(
-        f"ds{excluded_ds}_spoof detection recall="
+        f"ds{excluded_ds}_spoof accuracy={row['test_accuracy']:.4f} "
+        f"recall="
         f"{row['test_recall_detection_rate']:.4f} "
         f"mean_prob={row['test_mean_probability']:.4f} "
-        f"TP={row['test_tp']} FN={row['test_fn']}"
+        f"TP={row['test_tp']} TN={row['test_tn']} "
+        f"FP={row['test_fp']} FN={row['test_fn']}"
     )
     return row
 
@@ -370,6 +541,7 @@ def main() -> None:
             cfg=cfg,
             output_dir=output_dir,
             threshold=args.threshold,
+            eval_clean_frac=args.eval_clean_frac,
             save_models=not args.no_save_models,
         )
         for ds_id in SPOOF_IDS
@@ -380,7 +552,17 @@ def main() -> None:
     with (output_dir / "summary.json").open("w", encoding="utf-8") as f:
         json.dump([json_safe(row) for row in rows], f, indent=2, allow_nan=False)
 
+    summary_tex = output_dir / "summary_table.tex"
+    write_latex_table(summary_tex, rows, cfg=cfg, threshold=args.threshold)
+    pdf_path = summary_tex.with_suffix(".pdf")
+    pdf_ok = False
+    if not args.skip_pdf:
+        pdf_ok = compile_latex_pdf(summary_tex)
+
     print(f"\nSaved summary: {summary_csv}")
+    print(f"Saved LaTeX table: {summary_tex}")
+    if pdf_ok:
+        print(f"Saved PDF table: {pdf_path}")
     print("Leave-one-out run complete.")
 
 
