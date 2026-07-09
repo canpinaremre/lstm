@@ -460,6 +460,10 @@ def print_confusion(
     title: str = "",
 ) -> dict:
     y_prob = model.predict(X, batch_size=256, verbose=0).reshape(-1)
+    return print_confusion_from_probs(y_prob, y, threshold=threshold, title=title)
+
+
+def confusion_from_probs(y_prob: np.ndarray, y: np.ndarray, threshold: float) -> dict:
     y_pred = (y_prob >= threshold).astype(np.int32)
 
     tp = int(np.sum((y == 1) & (y_pred == 1)))
@@ -471,12 +475,6 @@ def print_confusion(
     rec = tp / (tp + fn + 1e-9)
     f1 = 2.0 * prec * rec / (prec + rec + 1e-9)
 
-    if title:
-        print(f"{title}")
-    print(
-        f"Confusion @thr={threshold:.2f}: TP={tp} FP={fp} TN={tn} FN={fn} "
-        f"| precision={prec:.4f} recall={rec:.4f} f1={f1:.4f}"
-    )
     return {
         "threshold": float(threshold),
         "tp": tp,
@@ -487,6 +485,35 @@ def print_confusion(
         "recall": float(rec),
         "f1": float(f1),
     }
+
+
+def print_confusion_from_probs(
+    y_prob: np.ndarray,
+    y: np.ndarray,
+    threshold: float = 0.5,
+    title: str = "",
+) -> dict:
+    result = confusion_from_probs(y_prob, y, threshold)
+
+    if title:
+        print(f"{title}")
+    print(
+        f"Confusion @thr={threshold:.2f}: TP={result['tp']} FP={result['fp']} "
+        f"TN={result['tn']} FN={result['fn']} | precision={result['precision']:.4f} "
+        f"recall={result['recall']:.4f} f1={result['f1']:.4f}"
+    )
+    return result
+
+
+def find_best_f1_threshold(y_prob: np.ndarray, y: np.ndarray) -> dict:
+    """Choose the threshold that maximizes F1 on validation predictions."""
+    best = None
+    for threshold in np.linspace(0.01, 0.99, 99):
+        result = confusion_from_probs(y_prob, y, float(threshold))
+        if best is None or result["f1"] > best["f1"]:
+            best = result
+
+    return best
 
 
 def save_tflite_model(model: tf.keras.Model, output_path: str = "lstm_spoof_detector.tflite") -> None:
@@ -638,9 +665,23 @@ def main(run_timestamp: str, run_dir: Path) -> None:
     print("\nEvaluation (TEST):")
     test_results = model.evaluate(test_ds, verbose=2, return_dict=True)
 
-    # Confusion matrices at default threshold 0.5
-    val_confusion = print_confusion(model, X_val, y_val, threshold=0.5, title="VAL confusion")
-    test_confusion = print_confusion(model, X_test, y_test, threshold=0.5, title="TEST confusion")
+    # Choose threshold on validation only, then apply it to test.
+    val_prob = model.predict(X_val, batch_size=256, verbose=0).reshape(-1)
+    test_prob = model.predict(X_test, batch_size=256, verbose=0).reshape(-1)
+    best_threshold = find_best_f1_threshold(val_prob, y_val)
+    threshold = best_threshold["threshold"]
+    print(
+        "\nBest threshold from VAL F1 sweep: "
+        f"{threshold:.2f} | precision={best_threshold['precision']:.4f} "
+        f"recall={best_threshold['recall']:.4f} f1={best_threshold['f1']:.4f}"
+    )
+
+    val_confusion = print_confusion_from_probs(
+        val_prob, y_val, threshold=threshold, title="VAL confusion at best F1 threshold"
+    )
+    test_confusion = print_confusion_from_probs(
+        test_prob, y_test, threshold=threshold, title="TEST confusion at best VAL F1 threshold"
+    )
 
     eval_results_path = run_dir / "evaluation_results.json"
     eval_results = {
@@ -648,6 +689,12 @@ def main(run_timestamp: str, run_dir: Path) -> None:
         "run_dir": str(run_dir),
         "monitor_metric": cfg.monitor_metric,
         "best_weights_path": best_weights_path,
+        "threshold_selection": {
+            "metric": "f1",
+            "selected_on": "validation",
+            "selected_threshold": float(threshold),
+            "validation_result": best_threshold,
+        },
         "validation": {key: float(value) for key, value in val_results.items()},
         "test": {key: float(value) for key, value in test_results.items()},
         "validation_confusion": val_confusion,
