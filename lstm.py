@@ -1,4 +1,7 @@
 import sys
+import json
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -56,6 +59,23 @@ class Config:
 # -----------------------------
 # Helpers
 # -----------------------------
+
+class Tee:
+    """Write terminal output to multiple streams."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data: str) -> int:
+        for stream in self.streams:
+            stream.write(data)
+            stream.flush()
+        return len(data)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
+
 
 def _to_2d(a) -> np.ndarray:
     a = np.asarray(a)
@@ -436,7 +456,7 @@ def print_confusion(
     y: np.ndarray,
     threshold: float = 0.5,
     title: str = "",
-) -> None:
+) -> dict:
     y_prob = model.predict(X, batch_size=256, verbose=0).reshape(-1)
     y_pred = (y_prob >= threshold).astype(np.int32)
 
@@ -455,6 +475,16 @@ def print_confusion(
         f"Confusion @thr={threshold:.2f}: TP={tp} FP={fp} TN={tn} FN={fn} "
         f"| precision={prec:.4f} recall={rec:.4f} f1={f1:.4f}"
     )
+    return {
+        "threshold": float(threshold),
+        "tp": tp,
+        "fp": fp,
+        "tn": tn,
+        "fn": fn,
+        "precision": float(prec),
+        "recall": float(rec),
+        "f1": float(f1),
+    }
 
 
 def save_tflite_model(model: tf.keras.Model, output_path: str = "lstm_spoof_detector.tflite") -> None:
@@ -517,7 +547,7 @@ def configure_accelerator() -> None:
     print(f"Using GPU for training: {names}")
 
 
-def main() -> None:
+def main(run_timestamp: str) -> None:
     cfg = Config()
     outputs_dir = Path("outputs")
     outputs_dir.mkdir(parents=True, exist_ok=True)
@@ -599,14 +629,28 @@ def main() -> None:
         print(f"Warning: could not load best weights ({e}). Using last epoch weights.")
 
     print("\nEvaluation (VAL):")
-    model.evaluate(val_ds, verbose=2)
+    val_results = model.evaluate(val_ds, verbose=2, return_dict=True)
 
     print("\nEvaluation (TEST):")
-    model.evaluate(test_ds, verbose=2)
+    test_results = model.evaluate(test_ds, verbose=2, return_dict=True)
 
     # Confusion matrices at default threshold 0.5
-    print_confusion(model, X_val, y_val, threshold=0.5, title="VAL confusion")
-    print_confusion(model, X_test, y_test, threshold=0.5, title="TEST confusion")
+    val_confusion = print_confusion(model, X_val, y_val, threshold=0.5, title="VAL confusion")
+    test_confusion = print_confusion(model, X_test, y_test, threshold=0.5, title="TEST confusion")
+
+    eval_results_path = outputs_dir / f"evaluation_results_{run_timestamp}.json"
+    eval_results = {
+        "timestamp": run_timestamp,
+        "monitor_metric": cfg.monitor_metric,
+        "best_weights_path": best_weights_path,
+        "validation": {key: float(value) for key, value in val_results.items()},
+        "test": {key: float(value) for key, value in test_results.items()},
+        "validation_confusion": val_confusion,
+        "test_confusion": test_confusion,
+    }
+    with open(eval_results_path, "w", encoding="utf-8") as f:
+        json.dump(eval_results, f, indent=2)
+    print(f"Saved: {eval_results_path}")
 
     # 7) Save final model (with best weights loaded)
     save_tflite_model(model, output_path=str(outputs_dir / "lstm_spoof_detector.tflite"))
@@ -622,5 +666,19 @@ def main() -> None:
     print("Saved: train_history.npz")
 
 
+def run_with_log() -> None:
+    outputs_dir = Path("outputs")
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = outputs_dir / f"run_{run_timestamp}.log"
+
+    with open(log_path, "w", encoding="utf-8") as log_file:
+        tee_stdout = Tee(sys.stdout, log_file)
+        tee_stderr = Tee(sys.stderr, log_file)
+        with redirect_stdout(tee_stdout), redirect_stderr(tee_stderr):
+            print(f"Logging terminal output to: {log_path}")
+            main(run_timestamp)
+
+
 if __name__ == "__main__":
-    main()
+    run_with_log()
