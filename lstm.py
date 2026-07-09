@@ -10,7 +10,7 @@ import numpy as np
 import tensorflow as tf
 from scipy.io import loadmat
 
-# Optional GUI file picker (desktop). If not available, use CLI args.
+# Optional GUI file picker (desktop). Used when CLI paths are not provided.
 try:
     import tkinter as tk
     from tkinter import filedialog
@@ -163,7 +163,12 @@ def make_windows_for_series(
 
 
 def pick_paths_from_user() -> Tuple[str, str]:
-    """Try GUI picker, else expect CLI: python lstm.py spoofed.mat genuine.mat"""
+    """Use CLI paths when provided, otherwise try the GUI picker."""
+    if len(sys.argv) == 3:
+        return sys.argv[1], sys.argv[2]
+    if len(sys.argv) > 3:
+        raise RuntimeError("Usage: python lstm.py path/to/spoofed.mat path/to/genuine.mat")
+
     if tk is not None and filedialog is not None:
         try:
             root = tk.Tk()
@@ -187,10 +192,7 @@ def pick_paths_from_user() -> Tuple[str, str]:
         except Exception:
             pass
 
-    if len(sys.argv) < 3:
-        raise RuntimeError("Usage: python lstm.py path/to/spoofed.mat path/to/genuine.mat")
-
-    return sys.argv[1], sys.argv[2]
+    raise RuntimeError("Usage: python lstm.py path/to/spoofed.mat path/to/genuine.mat")
 
 
 def load_and_validate(
