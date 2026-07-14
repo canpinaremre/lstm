@@ -1,14 +1,29 @@
-import sys
+from __future__ import annotations
+
+import argparse
 import json
+import sys
+import time
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
-import tensorflow as tf
-from scipy.io import loadmat
+try:
+    import numpy as np
+except ModuleNotFoundError:  # Allows --help without the training environment.
+    np = None
+
+try:
+    import tensorflow as tf
+except ModuleNotFoundError:  # Allows --help without the training environment.
+    tf = None
+
+try:
+    from scipy.io import loadmat
+except ModuleNotFoundError:  # Allows --help without the training environment.
+    loadmat = None
 
 # Optional GUI file picker (desktop). Used when CLI paths are not provided.
 try:
@@ -48,12 +63,185 @@ class Config:
     seed: int = 580
     shuffle_buffer: int = 500
 
+    # Model parameters
+    lstm_units: int = 64
+    dense_units: int = 32
+    dropout: float = 0.0
+    learning_rate: float = 1e-3
+    l2_regularization: float = 1e-4
+
     # Train all epochs, but keep best weights using ModelCheckpoint
     monitor_metric: str = "val_auc"  # or "val_prauc"
+
+    # Report metrics at this threshold and optionally tune another on validation.
+    prediction_threshold: float = 0.50
+    tune_f1_threshold: bool = True
+
+    # Small normalized subsets saved for the optional SHAP analysis script.
+    shap_background_size: int = 100
+    shap_explain_size: int = 100
 
     # Window validity rules (based on sv_id)
     drop_if_sv_contains_zero: bool = True
     require_prev_sample_valid: bool = True
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return parsed
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    defaults = Config()
+    parser = argparse.ArgumentParser(
+        description="Train and evaluate an LSTM GNSS spoof detector.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("spoofed_file", nargs="?", help="Spoofed MAT file.")
+    parser.add_argument("genuine_file", nargs="?", help="Genuine MAT file.")
+
+    data = parser.add_argument_group("windowing and data")
+    data.add_argument("--features", nargs="+", default=list(defaults.feature_keys))
+    data.add_argument("--window", type=positive_int, default=defaults.window)
+    data.add_argument("--stride", type=positive_int, default=defaults.stride)
+    data.add_argument("--train-frac", type=float, default=defaults.train_frac)
+    data.add_argument("--val-frac", type=float, default=defaults.val_frac)
+    data.add_argument("--spoof-ratio", type=float, default=defaults.spoof_ratio)
+    data.add_argument(
+        "--allow-sv-zero",
+        action="store_true",
+        help="Keep windows containing sv_id == 0.",
+    )
+    data.add_argument(
+        "--allow-invalid-previous-sample",
+        action="store_true",
+        help="Do not require a valid sample immediately before each window.",
+    )
+
+    model = parser.add_argument_group("model and training")
+    model.add_argument("--lstm-units", type=positive_int, default=defaults.lstm_units)
+    model.add_argument("--dense-units", type=positive_int, default=defaults.dense_units)
+    model.add_argument("--dropout", type=float, default=defaults.dropout)
+    model.add_argument("--learning-rate", type=float, default=defaults.learning_rate)
+    model.add_argument("--l2-regularization", type=float, default=defaults.l2_regularization)
+    model.add_argument("--batch-size", type=positive_int, default=defaults.batch_size)
+    model.add_argument("--epochs", type=positive_int, default=defaults.epochs)
+    model.add_argument("--seed", type=int, default=defaults.seed)
+    model.add_argument("--shuffle-buffer", type=positive_int, default=defaults.shuffle_buffer)
+    model.add_argument(
+        "--monitor-metric",
+        choices=("val_auc", "val_prauc", "val_acc"),
+        default=defaults.monitor_metric,
+    )
+
+    evaluation = parser.add_argument_group("evaluation and explanation")
+    evaluation.add_argument(
+        "--prediction-threshold",
+        type=float,
+        default=defaults.prediction_threshold,
+        help="Fixed threshold reported alongside the validation-tuned threshold.",
+    )
+    evaluation.add_argument(
+        "--no-tune-f1-threshold",
+        action="store_true",
+        help="Use prediction-threshold instead of selecting a threshold on validation F1.",
+    )
+    evaluation.add_argument(
+        "--shap-background-size",
+        type=nonnegative_int,
+        default=defaults.shap_background_size,
+    )
+    evaluation.add_argument(
+        "--shap-explain-size",
+        type=nonnegative_int,
+        default=defaults.shap_explain_size,
+    )
+    evaluation.add_argument(
+        "--no-shap-samples",
+        action="store_true",
+        help="Do not save the small normalized sample bundle used by explain_shap.py.",
+    )
+
+    output = parser.add_argument_group("output")
+    output.add_argument("--output-dir", default="outputs", help="Parent directory for this run.")
+    output.add_argument("--run-name", help="Run folder name; timestamp when omitted.")
+    output.add_argument("--no-keras", action="store_true", help="Skip the final .keras model export.")
+    output.add_argument("--no-tflite", action="store_true", help="Skip TensorFlow Lite export.")
+    output.add_argument("--no-saved-model", action="store_true", help="Skip SavedModel export.")
+
+    args = parser.parse_args(argv)
+    if bool(args.spoofed_file) != bool(args.genuine_file):
+        parser.error("provide both spoofed_file and genuine_file, or neither to use the file picker")
+    if not (0.0 < args.train_frac < 1.0):
+        parser.error("--train-frac must be between 0 and 1")
+    if not (0.0 <= args.val_frac < 1.0):
+        parser.error("--val-frac must be between 0 and 1")
+    if args.train_frac + args.val_frac >= 1.0:
+        parser.error("--train-frac + --val-frac must be less than 1")
+    if not (0.0 < args.spoof_ratio < 1.0):
+        parser.error("--spoof-ratio must be between 0 and 1")
+    if not (0.0 <= args.dropout < 1.0):
+        parser.error("--dropout must be at least 0 and less than 1")
+    if args.learning_rate <= 0.0:
+        parser.error("--learning-rate must be positive")
+    if args.l2_regularization < 0.0:
+        parser.error("--l2-regularization must be non-negative")
+    if not (0.0 <= args.prediction_threshold <= 1.0):
+        parser.error("--prediction-threshold must be between 0 and 1")
+    return args
+
+
+def config_from_args(args: argparse.Namespace) -> Config:
+    shap_background_size = 0 if args.no_shap_samples else args.shap_background_size
+    shap_explain_size = 0 if args.no_shap_samples else args.shap_explain_size
+    return Config(
+        feature_keys=tuple(args.features),
+        window=args.window,
+        stride=args.stride,
+        train_frac=args.train_frac,
+        val_frac=args.val_frac,
+        spoof_ratio=args.spoof_ratio,
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        seed=args.seed,
+        shuffle_buffer=args.shuffle_buffer,
+        lstm_units=args.lstm_units,
+        dense_units=args.dense_units,
+        dropout=args.dropout,
+        learning_rate=args.learning_rate,
+        l2_regularization=args.l2_regularization,
+        monitor_metric=args.monitor_metric,
+        prediction_threshold=args.prediction_threshold,
+        tune_f1_threshold=not args.no_tune_f1_threshold,
+        shap_background_size=shap_background_size,
+        shap_explain_size=shap_explain_size,
+        drop_if_sv_contains_zero=not args.allow_sv_zero,
+        require_prev_sample_valid=not args.allow_invalid_previous_sample,
+    )
+
+
+def require_training_dependencies() -> None:
+    missing = []
+    if np is None:
+        missing.append("numpy")
+    if tf is None:
+        missing.append("tensorflow")
+    if loadmat is None:
+        missing.append("scipy")
+    if missing:
+        raise RuntimeError(
+            "Missing training dependencies: " + ", ".join(missing) + ". "
+            "Run this script from the Python environment used for model training."
+        )
 
 
 # -----------------------------
@@ -162,12 +350,13 @@ def make_windows_for_series(
     return X, y
 
 
-def pick_paths_from_user() -> Tuple[str, str]:
-    """Use CLI paths when provided, otherwise try the GUI picker."""
-    if len(sys.argv) == 3:
-        return sys.argv[1], sys.argv[2]
-    if len(sys.argv) > 3:
-        raise RuntimeError("Usage: python lstm.py path/to/spoofed.mat path/to/genuine.mat")
+def pick_paths_from_user(
+    spoofed_path: Optional[str] = None,
+    genuine_path: Optional[str] = None,
+) -> Tuple[str, str]:
+    """Use supplied CLI paths when provided, otherwise try the GUI picker."""
+    if spoofed_path is not None and genuine_path is not None:
+        return spoofed_path, genuine_path
 
     if tk is not None and filedialog is not None:
         try:
@@ -192,7 +381,7 @@ def pick_paths_from_user() -> Tuple[str, str]:
         except Exception:
             pass
 
-    raise RuntimeError("Usage: python lstm.py path/to/spoofed.mat path/to/genuine.mat")
+    raise RuntimeError("Provide spoofed and genuine MAT files on the command line.")
 
 
 def load_and_validate(
@@ -424,23 +613,24 @@ def build_tf_datasets(
 
 def build_model(cfg: Config, num_features: int) -> tf.keras.Model:
     # Regularizers affect training only; they do not complicate inference graphs.
-    reg = tf.keras.regularizers.l2(1e-4)
+    reg = tf.keras.regularizers.l2(cfg.l2_regularization)
 
     model = tf.keras.Sequential([
         tf.keras.layers.Input(shape=(cfg.window, num_features)),
         # Keep recurrent_dropout at 0 so TensorFlow can use the fast cuDNN LSTM kernel on GPU.
         tf.keras.layers.LSTM(
-            64,
+            cfg.lstm_units,
             kernel_regularizer=reg,
             recurrent_regularizer=reg,
             recurrent_dropout=0.0,
         ),
-        tf.keras.layers.Dense(32, activation="relu", kernel_regularizer=reg),
+        tf.keras.layers.Dropout(cfg.dropout),
+        tf.keras.layers.Dense(cfg.dense_units, activation="relu", kernel_regularizer=reg),
         tf.keras.layers.Dense(1, activation="sigmoid"),
     ])
 
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(1e-3),
+        optimizer=tf.keras.optimizers.Adam(cfg.learning_rate),
         loss="binary_crossentropy",
         metrics=[
             tf.keras.metrics.BinaryAccuracy(name="acc"),
@@ -466,6 +656,11 @@ def print_confusion(
 
 
 def confusion_from_probs(y_prob: np.ndarray, y: np.ndarray, threshold: float) -> dict:
+    y_prob = np.asarray(y_prob, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.int32).reshape(-1)
+    if y_prob.shape[0] != y.shape[0]:
+        raise ValueError("y_prob and y must contain the same number of samples.")
+
     y_pred = (y_prob >= threshold).astype(np.int32)
 
     tp = int(np.sum((y == 1) & (y_pred == 1)))
@@ -473,9 +668,19 @@ def confusion_from_probs(y_prob: np.ndarray, y: np.ndarray, threshold: float) ->
     fp = int(np.sum((y == 0) & (y_pred == 1)))
     fn = int(np.sum((y == 1) & (y_pred == 0)))
 
-    prec = tp / (tp + fp + 1e-9)
-    rec = tp / (tp + fn + 1e-9)
-    f1 = 2.0 * prec * rec / (prec + rec + 1e-9)
+    def safe_ratio(numerator: float, denominator: float) -> float:
+        return float(numerator / denominator) if denominator else 0.0
+
+    total = tp + tn + fp + fn
+    precision = safe_ratio(tp, tp + fp)
+    recall = safe_ratio(tp, tp + fn)
+    specificity = safe_ratio(tn, tn + fp)
+    npv = safe_ratio(tn, tn + fn)
+    f1 = safe_ratio(2.0 * precision * recall, precision + recall)
+    accuracy = safe_ratio(tp + tn, total)
+    balanced_accuracy = 0.5 * (recall + specificity)
+    mcc_denominator = np.sqrt(float((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)))
+    matthews_corrcoef = safe_ratio(tp * tn - fp * fn, mcc_denominator)
 
     return {
         "threshold": float(threshold),
@@ -483,9 +688,22 @@ def confusion_from_probs(y_prob: np.ndarray, y: np.ndarray, threshold: float) ->
         "fp": fp,
         "tn": tn,
         "fn": fn,
-        "precision": float(prec),
-        "recall": float(rec),
-        "f1": float(f1),
+        "support": total,
+        "positive_support": tp + fn,
+        "negative_support": tn + fp,
+        "accuracy": accuracy,
+        "balanced_accuracy": balanced_accuracy,
+        "precision": precision,
+        "recall": recall,
+        "specificity": specificity,
+        "negative_predictive_value": npv,
+        "f1": f1,
+        "matthews_corrcoef": matthews_corrcoef,
+        "false_positive_rate": 1.0 - specificity,
+        "false_negative_rate": 1.0 - recall,
+        "prevalence": safe_ratio(tp + fn, total),
+        "predicted_positive_rate": safe_ratio(tp + fp, total),
+        "mean_probability": float(np.mean(y_prob)) if total else 0.0,
     }
 
 
@@ -501,8 +719,9 @@ def print_confusion_from_probs(
         print(f"{title}")
     print(
         f"Confusion @thr={threshold:.2f}: TP={result['tp']} FP={result['fp']} "
-        f"TN={result['tn']} FN={result['fn']} | precision={result['precision']:.4f} "
-        f"recall={result['recall']:.4f} f1={result['f1']:.4f}"
+        f"TN={result['tn']} FN={result['fn']} | accuracy={result['accuracy']:.4f} "
+        f"precision={result['precision']:.4f} recall={result['recall']:.4f} "
+        f"specificity={result['specificity']:.4f} f1={result['f1']:.4f}"
     )
     return result
 
@@ -516,6 +735,68 @@ def find_best_f1_threshold(y_prob: np.ndarray, y: np.ndarray) -> dict:
             best = result
 
     return best
+
+
+def sample_rows(
+    X: np.ndarray,
+    y: np.ndarray,
+    max_samples: int,
+    seed: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Take a deterministic, approximately class-balanced subset."""
+    if max_samples <= 0 or X.shape[0] == 0:
+        return X[:0], y[:0]
+    if X.shape[0] <= max_samples:
+        return X.copy(), y.copy()
+
+    rng = np.random.default_rng(seed)
+    classes = np.unique(y)
+    per_class = max(1, max_samples // max(1, len(classes)))
+    selected: List[int] = []
+    for class_value in classes:
+        class_indices = np.flatnonzero(y == class_value)
+        take = min(per_class, class_indices.shape[0])
+        selected.extend(rng.choice(class_indices, size=take, replace=False).tolist())
+
+    if len(selected) < max_samples:
+        remaining = np.setdiff1d(np.arange(y.shape[0]), np.asarray(selected), assume_unique=False)
+        take = min(max_samples - len(selected), remaining.shape[0])
+        selected.extend(rng.choice(remaining, size=take, replace=False).tolist())
+
+    selected_array = np.asarray(selected[:max_samples], dtype=np.int64)
+    rng.shuffle(selected_array)
+    return X[selected_array], y[selected_array]
+
+
+def save_shap_samples(
+    run_dir: Path,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    cfg: Config,
+) -> Optional[Path]:
+    if cfg.shap_background_size <= 0 or cfg.shap_explain_size <= 0:
+        return None
+
+    X_background, y_background = sample_rows(
+        X_train, y_train, cfg.shap_background_size, cfg.seed + 1001
+    )
+    X_explain, y_explain = sample_rows(
+        X_test, y_test, cfg.shap_explain_size, cfg.seed + 1002
+    )
+    output_path = run_dir / "shap_samples.npz"
+    np.savez_compressed(
+        output_path,
+        X_background=X_background,
+        y_background=y_background,
+        X_explain=X_explain,
+        y_explain=y_explain,
+        feature_keys=np.asarray(cfg.feature_keys),
+        window=np.asarray([cfg.window], dtype=np.int32),
+    )
+    print(f"Saved: {output_path}")
+    return output_path
 
 
 def save_tflite_model(model: tf.keras.Model, output_path: str = "lstm_spoof_detector.tflite") -> None:
@@ -578,15 +859,44 @@ def configure_accelerator() -> None:
     print(f"Using GPU for training: {names}")
 
 
-def main(run_timestamp: str, run_dir: Path) -> None:
-    cfg = Config()
+def main(
+    run_timestamp: str,
+    run_dir: Path,
+    cfg: Config,
+    spoofed_path: str,
+    genuine_path: str,
+    save_keras: bool = True,
+    save_tflite: bool = True,
+    save_saved_model: bool = True,
+) -> Dict[str, Any]:
+    started = time.perf_counter()
     run_dir.mkdir(parents=True, exist_ok=True)
 
     np.random.seed(cfg.seed)
     tf.random.set_seed(cfg.seed)
     configure_accelerator()
 
-    spoofed_path, genuine_path = pick_paths_from_user()
+    spoofed_path = str(Path(spoofed_path).expanduser().resolve())
+    genuine_path = str(Path(genuine_path).expanduser().resolve())
+    run_config = {
+        "timestamp": run_timestamp,
+        "run_dir": str(run_dir.resolve()),
+        "input_files": {
+            "spoofed": spoofed_path,
+            "genuine": genuine_path,
+        },
+        "config": asdict(cfg),
+        "exports": {
+            "keras": save_keras,
+            "tflite": save_tflite,
+            "saved_model": save_saved_model,
+        },
+    }
+    run_config_path = run_dir / "run_config.json"
+    with run_config_path.open("w", encoding="utf-8") as config_file:
+        json.dump(run_config, config_file, indent=2)
+    print(f"Configuration:\n{json.dumps(run_config, indent=2)}")
+    print(f"Saved: {run_config_path}")
 
     mat_spoofed = loadmat(spoofed_path)
     mat_genuine = loadmat(genuine_path)
@@ -629,13 +939,14 @@ def main(run_timestamp: str, run_dir: Path) -> None:
         feature_keys=np.array(cfg.feature_keys),
     )
     print(f"Saved: {norm_params_path}")
+    shap_samples_path = save_shap_samples(run_dir, X_train, y_train, X_test, y_test, cfg)
 
     # 4) tf.data
     train_ds, val_ds, test_ds = build_tf_datasets(X_train, y_train, X_val, y_val, X_test, y_test, cfg)
 
     # 5) Model + checkpoint (train full epochs, keep best weights)
     model = build_model(cfg, num_features=len(cfg.feature_keys))
-    best_weights_path = str(run_dir / "obest_weights.weights.h5")
+    best_weights_path = str(run_dir / "best_weights.weights.h5")
 
     ckpt = tf.keras.callbacks.ModelCheckpoint(
         filepath=best_weights_path,
@@ -670,67 +981,142 @@ def main(run_timestamp: str, run_dir: Path) -> None:
     # Choose threshold on validation only, then apply it to test.
     val_prob = model.predict(X_val, batch_size=256, verbose=0).reshape(-1)
     test_prob = model.predict(X_test, batch_size=256, verbose=0).reshape(-1)
-    best_threshold = find_best_f1_threshold(val_prob, y_val)
-    threshold = best_threshold["threshold"]
-    print(
-        "\nBest threshold from VAL F1 sweep: "
-        f"{threshold:.2f} | precision={best_threshold['precision']:.4f} "
-        f"recall={best_threshold['recall']:.4f} f1={best_threshold['f1']:.4f}"
+    fixed_threshold = cfg.prediction_threshold
+    print("\nFixed-threshold metrics:")
+    val_fixed_metrics = print_confusion_from_probs(
+        val_prob, y_val, threshold=fixed_threshold, title="VAL"
+    )
+    test_fixed_metrics = print_confusion_from_probs(
+        test_prob, y_test, threshold=fixed_threshold, title="TEST"
     )
 
-    val_confusion = print_confusion_from_probs(
-        val_prob, y_val, threshold=threshold, title="VAL confusion at best F1 threshold"
-    )
-    test_confusion = print_confusion_from_probs(
-        test_prob, y_test, threshold=threshold, title="TEST confusion at best VAL F1 threshold"
-    )
+    if cfg.tune_f1_threshold:
+        best_threshold = find_best_f1_threshold(val_prob, y_val)
+        threshold = best_threshold["threshold"]
+        print(
+            "\nBest threshold from VAL F1 sweep: "
+            f"{threshold:.2f} | precision={best_threshold['precision']:.4f} "
+            f"recall={best_threshold['recall']:.4f} f1={best_threshold['f1']:.4f}"
+        )
+    else:
+        best_threshold = val_fixed_metrics
+        threshold = fixed_threshold
+        print(f"\nF1 threshold tuning disabled; using fixed threshold {threshold:.2f}.")
 
-    eval_results_path = run_dir / "evaluation_results.json"
-    eval_results = {
-        "timestamp": run_timestamp,
-        "run_dir": str(run_dir),
-        "monitor_metric": cfg.monitor_metric,
-        "best_weights_path": best_weights_path,
-        "threshold_selection": {
-            "metric": "f1",
-            "selected_on": "validation",
-            "selected_threshold": float(threshold),
-            "validation_result": best_threshold,
-        },
-        "validation": {key: float(value) for key, value in val_results.items()},
-        "test": {key: float(value) for key, value in test_results.items()},
-        "validation_confusion": val_confusion,
-        "test_confusion": test_confusion,
-    }
-    with open(eval_results_path, "w", encoding="utf-8") as f:
-        json.dump(eval_results, f, indent=2)
-    print(f"Saved: {eval_results_path}")
+    val_selected_metrics = print_confusion_from_probs(
+        val_prob, y_val, threshold=threshold, title="VAL confusion at selected threshold"
+    )
+    test_selected_metrics = print_confusion_from_probs(
+        test_prob, y_test, threshold=threshold, title="TEST confusion at selected threshold"
+    )
 
     # 7) Save final model (with best weights loaded)
     tflite_path = run_dir / "lstm_spoof_detector.tflite"
     keras_path = run_dir / "lstm_spoof_detector.keras"
     saved_model_path = run_dir / "lstm_saved_model"
     weights_path = run_dir / "lstm_weights.weights.h5"
-    save_tflite_model(model, output_path=str(tflite_path))
-    model.save(str(keras_path))
-    model.export(str(saved_model_path))
     model.save_weights(str(weights_path))
-    print(f"Saved: {keras_path}")
-    print(f"Saved: {saved_model_path}")
     print(f"Saved: {weights_path}")
+    artifacts: Dict[str, Any] = {
+        "run_config": str(run_config_path),
+        "normalization": str(norm_params_path),
+        "best_weights": best_weights_path,
+        "weights": str(weights_path),
+    }
+    if shap_samples_path is not None:
+        artifacts["shap_samples"] = str(shap_samples_path)
+
+    export_jobs = []
+    if save_tflite:
+        export_jobs.append(("tflite", tflite_path, lambda: save_tflite_model(model, str(tflite_path))))
+    if save_keras:
+        export_jobs.append(("keras", keras_path, lambda: model.save(str(keras_path))))
+    if save_saved_model:
+        export_jobs.append(("saved_model", saved_model_path, lambda: model.export(str(saved_model_path))))
+
+    for artifact_name, artifact_path, export_job in export_jobs:
+        try:
+            export_job()
+            artifacts[artifact_name] = str(artifact_path)
+            print(f"Saved: {artifact_path}")
+        except Exception as error:
+            artifacts[f"{artifact_name}_error"] = str(error)
+            print(f"Warning: {artifact_name} export failed: {error}")
 
     # Save training history for later plotting
     train_history_path = run_dir / "train_history.npz"
     np.savez(str(train_history_path), **{k: np.array(v) for k, v in history.history.items()})
     print(f"Saved: {train_history_path}")
+    artifacts["training_history"] = str(train_history_path)
+
+    monitor_values = history.history.get(cfg.monitor_metric, [])
+    if monitor_values:
+        best_epoch_index = int(np.argmax(np.asarray(monitor_values)))
+        best_epoch = best_epoch_index + 1
+        best_monitor_value = float(monitor_values[best_epoch_index])
+    else:
+        best_epoch = None
+        best_monitor_value = None
+
+    eval_results_path = run_dir / "evaluation_results.json"
+    eval_results: Dict[str, Any] = {
+        "timestamp": run_timestamp,
+        "run_dir": str(run_dir.resolve()),
+        "input_files": run_config["input_files"],
+        "config": asdict(cfg),
+        "model": {
+            "lstm_units": cfg.lstm_units,
+            "dense_units": cfg.dense_units,
+            "trainable_parameters": int(model.count_params()),
+        },
+        "data": {
+            "raw_spoof_windows": int(X_spoof.shape[0]),
+            "raw_genuine_windows": int(X_genuine.shape[0]),
+            "train_windows": int(y_train.shape[0]),
+            "validation_windows": int(y_val.shape[0]),
+            "test_windows": int(y_test.shape[0]),
+            "train_spoof_windows": int(np.sum(y_train == 1)),
+            "validation_spoof_windows": int(np.sum(y_val == 1)),
+            "test_spoof_windows": int(np.sum(y_test == 1)),
+        },
+        "training": {
+            "epochs_completed": len(history.epoch),
+            "monitor_metric": cfg.monitor_metric,
+            "best_epoch": best_epoch,
+            "best_monitor_value": best_monitor_value,
+        },
+        "threshold_selection": {
+            "metric": "f1" if cfg.tune_f1_threshold else "fixed",
+            "selected_on": "validation" if cfg.tune_f1_threshold else "configuration",
+            "selected_threshold": float(threshold),
+            "validation_result": best_threshold,
+        },
+        "validation": {key: float(value) for key, value in val_results.items()},
+        "test": {key: float(value) for key, value in test_results.items()},
+        "validation_at_fixed_threshold": val_fixed_metrics,
+        "test_at_fixed_threshold": test_fixed_metrics,
+        "validation_at_selected_threshold": val_selected_metrics,
+        "test_at_selected_threshold": test_selected_metrics,
+        # Backward-compatible names retained for existing result readers.
+        "validation_confusion": val_selected_metrics,
+        "test_confusion": test_selected_metrics,
+        "artifacts": artifacts,
+        "duration_seconds": float(time.perf_counter() - started),
+    }
+    with eval_results_path.open("w", encoding="utf-8") as results_file:
+        json.dump(eval_results, results_file, indent=2)
+    print(f"Saved: {eval_results_path}")
+    return eval_results
 
 
-def run_with_log() -> None:
-    outputs_dir = Path("outputs")
+def run_with_log(args: argparse.Namespace) -> Path:
+    cfg = config_from_args(args)
+    spoofed_path, genuine_path = pick_paths_from_user(args.spoofed_file, args.genuine_file)
+    outputs_dir = Path(args.output_dir).expanduser()
     outputs_dir.mkdir(parents=True, exist_ok=True)
-    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = outputs_dir / run_timestamp
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    run_dir = outputs_dir / (args.run_name or run_timestamp)
+    run_dir.mkdir(parents=True, exist_ok=False)
     log_path = run_dir / "run.log"
 
     with open(log_path, "w", encoding="utf-8") as log_file:
@@ -739,8 +1125,20 @@ def run_with_log() -> None:
         with redirect_stdout(tee_stdout), redirect_stderr(tee_stderr):
             print(f"Run output directory: {run_dir}")
             print(f"Logging terminal output to: {log_path}")
-            main(run_timestamp, run_dir)
+            main(
+                run_timestamp=run_timestamp,
+                run_dir=run_dir,
+                cfg=cfg,
+                spoofed_path=spoofed_path,
+                genuine_path=genuine_path,
+                save_keras=not args.no_keras,
+                save_tflite=not args.no_tflite,
+                save_saved_model=not args.no_saved_model,
+            )
+    return run_dir
 
 
 if __name__ == "__main__":
-    run_with_log()
+    parsed_args = parse_args()
+    require_training_dependencies()
+    run_with_log(parsed_args)
